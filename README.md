@@ -95,16 +95,6 @@ python tools/check_event_representation.py --h5 /path/to/sample.h5
 Set `data.root` in a YAML config, or pass `--data-root` to the staged launcher.
 No RLED files are distributed in this repository.
 
-## Checkpoints
-
-Model weights are not stored in Git. See [MODEL_ZOO.md](MODEL_ZOO.md) for the
-expected filenames and placement. The released final checkpoint is compatible
-with `configs/inference.yaml`.
-
-RAFT-Small weights are also excluded. The staged geometry scripts expect the
-official torchvision file `raft_small_C_T_V2-01064c6d.pth` in the repository
-root, or a path supplied through `RAE_RAFT_WEIGHTS`.
-
 ## Inference
 
 The final flow/occlusion model uses RAFT-assisted inference. Set the three
