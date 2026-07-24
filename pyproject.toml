@@ -1,0 +1,26 @@
+[project]
+name = "raevdm-intensity"
+version = "0.1.0"
+description = "Reliability-calibrated event-guided intensity video diffusion for RLED."
+requires-python = ">=3.9"
+readme = "README.md"
+license = {file = "LICENSE"}
+dependencies = [
+  "torch>=2.1",
+  "torchvision>=0.16",
+  "numpy>=1.23",
+  "h5py>=3.8",
+  "PyYAML>=6.0",
+  "tqdm>=4.66",
+  "einops>=0.7",
+  "imageio>=2.31",
+  "scikit-image>=0.21",
+]
+
+[project.scripts]
+raevdm-train = "raevdm.train:main"
+raevdm-infer = "raevdm.infer:main"
+raevdm-evaluate = "raevdm.evaluate:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

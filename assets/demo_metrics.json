@@ -1,0 +1,19 @@
+{
+  "linear": {
+    "psnr_db": 18.743095517835936,
+    "mae": 0.0597666093710212,
+    "temporal_mae": 0.04688794855063237
+  },
+  "ours": {
+    "psnr_db": 29.608704841315443,
+    "mae": 0.01664668003565062,
+    "temporal_mae": 0.022936733405483405
+  },
+  "metadata": {
+    "source_width": 1120,
+    "source_height": 660,
+    "frames": 7,
+    "checkpoint": "FINAL_BEST_INFERENCE.pt",
+    "sample": 0
+  }
+}
