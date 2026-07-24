@@ -32,9 +32,10 @@ tiles; it is not a resized 256 x 256 test.
 | Linear interpolation | 18.74 | 0.0598 | 0.0469 |
 | **RaE-VDM (ours)** | **29.61** | **0.0166** | **0.0229** |
 
+![RaE-VDM full-resolution comparison poster](assets/demo_fullres_poster.png)
+
 The first and last animation frames are observed anchors. Frames 1--5 are
 unseen intermediate frames. Open the
-[300 dpi comparison poster](assets/demo_fullres_poster.png) or
 [high-resolution video](assets/demo_fullres_comparison.mp4) for closer
 inspection. Exact values and protocol metadata are stored in
 [`assets/demo_metrics.json`](assets/demo_metrics.json).
