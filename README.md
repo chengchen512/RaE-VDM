@@ -27,11 +27,6 @@ endpoint frames and the intervening event stream. This RLED example is inferred
 over the complete **1120 x 660** field of view using overlapping 256 x 256
 tiles; it is not a resized 256 x 256 test.
 
-| Method | PSNR (dB) | MAE | Temporal MAE |
-|---|---:|---:|---:|
-| Linear interpolation | 18.74 | 0.0598 | 0.0469 |
-| **RaE-VDM (ours)** | **29.61** | **0.0166** | **0.0229** |
-
 ![RaE-VDM full-resolution comparison poster](assets/demo_fullres_poster.png)
 
 The first and last animation frames are observed anchors. Frames 1--5 are
