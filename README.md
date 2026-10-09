@@ -143,35 +143,6 @@ torchrun --standalone --nproc_per_node=2 train.py \
   --resume /path/to/latest.pt
 ```
 
-## Complete Staged Training
-
-The staged launcher trains the diffusion core and then runs residual
-correction, flow fusion, occlusion refinement, and final joint tuning. Each run
-receives a timestamped output directory, so existing checkpoints are not
-overwritten.
-
-```bash
-python train_pipeline.py \
-  --variant full \
-  --data-root /path/to/RLED/train \
-  --gpus 0,1 \
-  --stage all
-```
-
-The final inference-only checkpoint is written as
-`FINAL_BEST_INFERENCE.pt` inside the final stage's `checkpoints/` directory.
-
-Useful environment variables for individual geometry stages:
-
-```text
-RAE_DATA_ROOT          RLED training directory
-RAE_RESUME_CHECKPOINT  Warm-start checkpoint
-RAE_RAFT_WEIGHTS       Official RAFT-Small weight file
-RAE_OUTPUT_DIR         Output root
-RAE_RUN_PREFIX         Unique run-name prefix
-RAE_GPU_IDS            Comma-separated CUDA device IDs
-```
-
 ## Evaluation
 
 ```bash
