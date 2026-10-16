@@ -4,7 +4,7 @@ Official research code for reliability-aware, event-guided intensity video
 interpolation with a conditional video diffusion prior, flow fusion, and
 occlusion-aware refinement.
 
-This repository contains model, training, evaluation, and inference code.
+This repository contains model, evaluation, and inference code.
 Datasets, pretrained checkpoints, logs, paper figures, and figure-generation
 scripts are intentionally not included. The small `assets/` directory contains
 only the source-resolution comparison used in this README.
@@ -15,7 +15,6 @@ only the source-resolution comparison used in this README.
 - Reliability- and observability-aware conditioning with count-domain residual gates.
 - Conditional 3D U-Net diffusion prior for intermediate-frame prediction.
 - Residual correction, frozen RAFT flow fusion, and occlusion refinement.
-- Single-GPU and distributed training.
 - Deterministic interpolation and tiled native-resolution inference.
 - Sequence-balanced evaluation on intermediate frames and synthetic regression tests.
 
@@ -42,8 +41,7 @@ inspection. Exact values and protocol metadata are stored in
 
 ```text
 assets/                               README demo GIF, MP4, poster, and metrics
-configs/paper.yaml                    Shared model and four-stage training recipe
-configs/                              Stage-specific and inference configurations
+configs/                              Model and inference configurations
 docs/                                 Theory-to-code and migration notes
 src/raevdm/                           Core package
 src/raevdm/data/                      RLED reader and event voxelization
@@ -83,14 +81,14 @@ image attributes: event_idx, size, timestamp
 optional: event_indices
 ```
 
-Inspect a dataset before training:
+Inspect a dataset:
 
 ```bash
 python tools/inspect_rled_h5.py --root /path/to/RLED
 python tools/check_event_representation.py --h5 /path/to/sample.h5
 ```
 
-Set `data.root` in a YAML config, or pass `--data-root` to the staged launcher.
+Set `data.root` in a YAML config, or pass `--data-root` to the evaluator.
 No RLED files are distributed in this repository.
 
 ## Inference
@@ -119,38 +117,6 @@ Paths can also be supplied through `RAE_CONFIG`, `RAE_CHECKPOINT`,
 `RAE_RAFT_WEIGHTS`, and `RAE_TEST_H5`. The checkpoint's saved architecture
 determines which model stages are enabled. See [migration notes](docs/migration.md)
 for compatibility and changed numerical behavior of older checkpoints.
-
-## Standard Training
-
-Run a one-step training smoke check with the configured dataset first:
-
-```bash
-python -m raevdm.train --config configs/train_core.yaml --smoke
-```
-
-Single GPU:
-
-```bash
-python -m raevdm.train --config configs/train_core.yaml
-```
-
-Two GPUs:
-
-```bash
-torchrun --standalone --nproc_per_node=2 --module raevdm.train \
-  --config configs/train_core.yaml
-```
-
-Resume the same stage, including optimizer state:
-
-```bash
-torchrun --standalone --nproc_per_node=2 --module raevdm.train \
-  --config configs/train_core.yaml \
-  --resume /path/to/latest.pt
-```
-
-The shared recipe is defined in `configs/paper.yaml`. Use `--warm-start` to
-initialize a new stage from the previous stage's checkpoint.
 
 ## Evaluation
 
@@ -181,9 +147,8 @@ These checks use synthetic inputs and do not establish dataset accuracy.
 
 - The final model uses 7-frame clips with endpoint anchors and predicts five
   intermediate frames.
-- Training crops are 256 x 256. Native-resolution inference uses overlapping
-  tiles rather than resizing the whole frame to 256 x 256.
-- Checkpoints save model, EMA, optimizer metadata, epoch, step, and config.
+- Native-resolution inference uses overlapping 256 x 256 tiles rather than
+  resizing the whole frame to 256 x 256.
 - The compact final inference checkpoint contains EMA model weights and config
   but omits optimizer state.
 
