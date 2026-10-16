@@ -1,68 +1,13 @@
-seed: 3407
+_base_: paper.yaml
 run_name: raevdm_inference
-output_dir: outputs
-
 data:
-  root: data/RLED
-  split: test
-  file_pattern: "**/*.h5"
-  max_files: null
-  clip_len: 7
-  clip_stride: 1
-  event_bins: 5
-  crop_size: [256, 256]
+  root: data/RLED/test
+  split: all
   random_crop: false
   random_flip: false
-  keyframe_policy: endpoints
-  keyframe_stride: 6
-  contrast_threshold: 0.2
-  val_every: 10
-  event_cache_size: 16
-
+  crop_size: null
 model:
-  in_channels: 1
-  event_feature_channels: 48
-  base_channels: 48
-  channel_mult: [1, 2, 4]
-  time_embed_dim: 192
-  use_reliability: true
-  use_observability: true
-  reliability_cue_channels: 0
-  event_gate_source: heuristic
-  use_linear_condition: true
   use_flow_fusion: true
-  flow_fusion_hidden_channels: 32
-  flow_fusion_refinement_scale: 0.05
-  flow_fusion_alpha_delta_scale: 2.0
   use_occlusion_refinement: true
-  occlusion_refinement_hidden_channels: 32
-  occlusion_refinement_scale: 0.06
-  occlusion_branch_delta_scale: 0.30
-
-diffusion:
-  timesteps: 1000
-  sampling_steps: 50
-  beta_start: 0.0001
-  beta_end: 0.02
-  schedule: linear
-
-loss:
-  diffusion: 1.0
-  reconstruction: 0.20
-  event_physics: 0.15
-  quiet: 0.05
-  anchor: 0.20
-  temporal: 0.02
-  reliability_calibration: 0.02
-  reliability_prior: 0.01
-  charbonnier_eps: 0.001
-
-train:
-  batch_size: 1
-  num_workers: 4
-  mixed_precision: true
-
-eval:
-  batch_size: 1
-  num_workers: 4
-  max_batches: null
+finetune:
+  mode: occlusion_refinement

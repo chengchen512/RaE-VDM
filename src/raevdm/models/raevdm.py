@@ -10,8 +10,8 @@ from .diffusion import DiffusionSchedule, extract
 from .flow_fusion import FlowResidualFusionHead
 from .occlusion_refinement import OcclusionAwareRefinementHead
 from .reliability import ReliabilityCalibratedEventEncoder
-from .reliability import collapse_event_steps
 from .unet3d import ConditionalVideoUNet
+from ..event_statistics import count_priors
 
 
 def video_to_bcthw(video: torch.Tensor) -> torch.Tensor:
@@ -34,7 +34,8 @@ def _scalar_int(value: Any) -> int:
     return int(value)
 
 
-def linear_keyframe_interpolation(keyframes: torch.Tensor, keyframe_mask: torch.Tensor) -> torch.Tensor:
+def linear_keyframe_interpolation(keyframes: torch.Tensor, keyframe_mask: torch.Tensor,
+                                 timestamps: torch.Tensor | None = None) -> torch.Tensor:
     """Piecewise-linear interpolation between available keyframes.
 
     Inputs and output use [B,T,C,H,W] in intensity range [0,1].
@@ -47,7 +48,7 @@ def linear_keyframe_interpolation(keyframes: torch.Tensor, keyframe_mask: torch.
         frame_is_key = keyframe_mask[b].flatten(1).amax(dim=1) > 0.5
         key_idx = torch.nonzero(frame_is_key, as_tuple=False).flatten().tolist()
         if not key_idx:
-            continue
+            raise ValueError("At least two endpoint anchors are required.")
         if len(key_idx) == 1:
             out[b] = keyframes[b, key_idx[0]]
             continue
@@ -57,13 +58,17 @@ def linear_keyframe_interpolation(keyframes: torch.Tensor, keyframe_mask: torch.
         for left, right in zip(key_idx[:-1], key_idx[1:]):
             denom = max(right - left, 1)
             for frame_idx in range(left, right + 1):
-                weight = float(frame_idx - left) / float(denom)
+                if timestamps is None:
+                    weight = float(frame_idx - left) / float(denom)
+                else:
+                    time = timestamps[b] if timestamps.ndim == 2 else timestamps
+                    weight = ((time[frame_idx] - time[left]) / (time[right] - time[left])).to(keyframes)
                 out[b, frame_idx] = (1.0 - weight) * keyframes[b, left] + weight * keyframes[b, right]
     return out
 
 
 class RaEVDM(nn.Module):
-    """Reliability-calibrated event-guided video diffusion for intensity clips."""
+    """Event-use confidence, count-gated residual prediction, and geometry."""
 
     def __init__(
         self,
@@ -75,7 +80,10 @@ class RaEVDM(nn.Module):
         use_reliability: bool = True,
         use_observability: bool = True,
         reliability_cue_channels: int = 0,
-        event_gate_source: str = "heuristic",
+        event_gate_source: str = "count",
+        confidence_mode: str = "learned",
+        confidence_threshold: float = 0.5,
+        observability_mode: str = "learned",
         use_linear_condition: bool = False,
         use_flow_fusion: bool = False,
         flow_fusion_hidden_channels: int = 32,
@@ -92,8 +100,8 @@ class RaEVDM(nn.Module):
         self.use_linear_condition = bool(use_linear_condition)
         self.reliability_cue_channels = int(max(reliability_cue_channels, 0))
         self.event_gate_source = str(event_gate_source).lower()
-        if self.event_gate_source not in {"heuristic", "learned", "hybrid"}:
-            raise ValueError("event_gate_source must be heuristic, learned, or hybrid.")
+        if self.event_gate_source not in {"count", "heuristic"}:
+            raise ValueError("The current paper uses a fixed count-derived gate; choose event_gate_source=count.")
         self.use_flow_fusion = bool(use_flow_fusion)
         self.use_occlusion_refinement = bool(use_occlusion_refinement)
         if self.use_occlusion_refinement and not self.use_flow_fusion:
@@ -104,6 +112,9 @@ class RaEVDM(nn.Module):
             use_reliability=use_reliability,
             use_observability=use_observability,
             cue_channels=self.reliability_cue_channels,
+            confidence_mode=confidence_mode,
+            confidence_threshold=confidence_threshold,
+            observability_mode=observability_mode,
         )
         self.denoiser = ConditionalVideoUNet(
             in_channels=in_channels,
@@ -136,7 +147,7 @@ class RaEVDM(nn.Module):
     def linear_condition(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor | None:
         if not self.use_linear_condition:
             return None
-        linear = linear_keyframe_interpolation(batch["keyframes"].float(), batch["keyframe_mask"].float())
+        linear = linear_keyframe_interpolation(batch["keyframes"].float(), batch["keyframe_mask"].float(), batch.get("timestamps"))
         return intensity_to_diffusion(video_to_bcthw(linear))
 
     def encode_condition(self, batch: Dict[str, torch.Tensor], target_frames: int) -> Dict[str, torch.Tensor]:
@@ -163,7 +174,7 @@ class RaEVDM(nn.Module):
         if self.reliability_cue_channels <= 0:
             return None
         linear = video_to_bcthw(
-            linear_keyframe_interpolation(batch["keyframes"].float(), batch["keyframe_mask"].float())
+            linear_keyframe_interpolation(batch["keyframes"].float(), batch["keyframe_mask"].float(), batch.get("timestamps"))
         ).clamp(0.0, 1.0)
         interval_intensity = 0.5 * (linear[:, :, :-1] + linear[:, :, 1:])
         darkness = 1.0 - interval_intensity
@@ -197,58 +208,24 @@ class RaEVDM(nn.Module):
         gate_power: float = 0.50,
         event_out: Dict[str, torch.Tensor] | None = None,
     ) -> torch.Tensor:
-        device = batch["frames"].device
-        h, w = batch["frames"].shape[-2:]
-        learned_motion = None
-        if self.event_gate_source in {"learned", "hybrid"} and event_out is not None:
-            event_bins = _scalar_int(batch.get("event_bins", 5))
-            raw = batch["event_raw"].float().clamp_min(0.0)
-            reliability = event_out["reliability"].clamp(0.0, 1.0)
-            rel_steps = (reliability * raw).sum(dim=1, keepdim=True) / raw.sum(
-                dim=1, keepdim=True
-            ).clamp_min(1e-6)
-            precision = collapse_event_steps(
-                rel_steps, clip_len=frames_t, event_bins=event_bins, reduce="mean"
-            ).clamp(0.0, 1.0)
-            observability = collapse_event_steps(
-                event_out["observability"], clip_len=frames_t, event_bins=event_bins, reduce="mean"
-            ).clamp(0.0, 1.0)
-            learned_motion = (1.0 - observability) * (0.25 + 0.75 * precision)
-
-        if "event_interval_observability" in batch:
-            obs = video_to_bcthw(batch["event_interval_observability"].float()).clamp(0.0, 1.0)
-            motion = (1.0 - obs).clamp(0.0, 1.0)
-            if "event_interval_precision" in batch:
-                precision = video_to_bcthw(batch["event_interval_precision"].float()).clamp(0.0, 1.0)
-                motion = motion * (0.25 + 0.75 * precision)
-        else:
-            raw = batch["event_raw"].float().abs().sum(dim=1, keepdim=True).clamp(0.0, 1.0)
-            event_bins = batch.get("event_bins", 5)
-            if torch.is_tensor(event_bins):
-                event_bins = int(event_bins.flatten()[0].detach().cpu().item())
-            motion = collapse_event_steps(raw, clip_len=frames_t, event_bins=int(event_bins), reduce="mean").clamp(0.0, 1.0)
-
-        if self.event_gate_source == "learned" and learned_motion is not None:
-            motion = learned_motion
-        elif self.event_gate_source == "hybrid" and learned_motion is not None:
-            motion = 0.5 * motion + 0.5 * learned_motion
-
-        gate = torch.zeros((motion.shape[0], 1, frames_t, h, w), device=device, dtype=motion.dtype)
-        intervals = motion.shape[2]
-        for frame_idx in range(frames_t):
-            if frame_idx == 0:
-                value = motion[:, :, 0]
-            elif frame_idx >= frames_t - 1:
-                value = motion[:, :, -1]
-            else:
-                left = min(frame_idx - 1, intervals - 1)
-                right = min(frame_idx, intervals - 1)
-                value = 0.5 * (motion[:, :, left] + motion[:, :, right])
-            gate[:, :, frame_idx] = value
-        gate = F.avg_pool3d(gate, kernel_size=(1, 5, 5), stride=1, padding=(0, 2, 2))
-        gate = gate.clamp(0.0, 1.0).pow(float(gate_power))
-        gate = (float(gate_floor) + (1.0 - float(gate_floor)) * gate).clamp(0.0, 1.0)
-        key_mask = video_to_bcthw(batch["keyframe_mask"].float()).clamp(0.0, 1.0)
+        """Eqs. (23)--(26): the gate is independent of learned R and O."""
+        if "event_counts" not in batch:
+            raise ValueError("Count-derived gating requires unnormalized event_counts.")
+        if not 0 <= gate_floor <= 1 or gate_power <= 0:
+            raise ValueError("Invalid gate floor/power.")
+        event_bins = _scalar_int(batch.get("event_bins", 5))
+        with torch.no_grad():
+            motion = batch.get("count_gate_motion")
+            if motion is None:
+                motion = count_priors(batch["event_counts"], event_bins)["count_motion"]
+        if motion.shape[2] != frames_t - 1:
+            raise ValueError("Count intervals do not match the requested frame sequence.")
+        h, w = batch["keyframes"].shape[-2:]
+        gate = motion.new_zeros(motion.shape[0], 1, frames_t, h, w)
+        gate[:, :, 1:-1] = 0.5 * (motion[:, :, :-1] + motion[:, :, 1:])
+        gate = F.avg_pool3d(gate, (1, 5, 5), stride=1, padding=(0, 2, 2))
+        gate = gate_floor + (1.0 - gate_floor) * gate.clamp(0.0, 1.0).pow(gate_power)
+        key_mask = video_to_bcthw(batch["keyframe_mask"].float())
         return gate * (1.0 - key_mask)
 
     def residual_correction(
@@ -263,16 +240,15 @@ class RaEVDM(nn.Module):
         gate_floor = float(residual_cfg.get("event_gate_floor", 0.08))
         gate_power = float(residual_cfg.get("event_gate_power", 0.50))
 
-        gt = video_to_bcthw(batch["frames"].float())
-        linear_btchw = linear_keyframe_interpolation(batch["keyframes"].float(), batch["keyframe_mask"].float())
+        linear_btchw = linear_keyframe_interpolation(batch["keyframes"].float(), batch["keyframe_mask"].float(), batch.get("timestamps"))
         linear = video_to_bcthw(linear_btchw).clamp(0.0, 1.0)
         key_mask = video_to_bcthw(batch["keyframe_mask"].float()).clamp(0.0, 1.0)
         keyframes_int = video_to_bcthw(batch["keyframes"].float()).clamp(0.0, 1.0)
         keyframes = intensity_to_diffusion(keyframes_int) * key_mask
-        bsz, _, frames_t, _, _ = gt.shape
+        bsz, _, frames_t, _, _ = linear.shape
 
         x = intensity_to_diffusion(linear)
-        timestep = torch.full((bsz,), residual_timestep, device=gt.device, dtype=torch.long)
+        timestep = torch.full((bsz,), residual_timestep, device=linear.device, dtype=torch.long)
         event_out = self.encode_condition(batch, frames_t)
         extra_condition = self.linear_condition(batch)
         raw_residual = self.denoiser(
@@ -292,16 +268,18 @@ class RaEVDM(nn.Module):
         )
         correction = residual_scale * torch.tanh(raw_residual / temperature) * event_gate
         correction = correction * (1.0 - key_mask)
-        pred = (linear + correction).clamp(0.0, 1.0)
+        pred_raw = linear + correction
+        pred = pred_raw.clamp(0.0, 1.0)
         pred = pred * (1.0 - key_mask) + keyframes_int * key_mask
         return {
             "pred": pred,
+            "pred_raw": pred_raw,
             "linear": linear,
             "correction": correction,
             "raw_residual": raw_residual,
             "event_gate": event_gate,
             "event": event_out,
-            "gt": gt,
+            "gt": video_to_bcthw(batch["frames"].float()) if "frames" in batch else None,
             "keyframe_mask": key_mask,
         }
 
@@ -404,7 +382,17 @@ class RaEVDM(nn.Module):
         residual_cfg: Dict[str, Any] | None = None,
         base_raft_peak: float = 0.55,
         detach_base: bool = False,
+        include_diffusion: bool = False,
     ) -> Dict[str, torch.Tensor]:
+        if include_diffusion:
+            deterministic = self.forward(batch, mode=mode, flow_inputs=flow_inputs,
+                                         residual_cfg=residual_cfg, base_raft_peak=base_raft_peak,
+                                         detach_base=detach_base)
+            return {**deterministic, "diffusion_outputs": self.forward(batch, t=t, mode="diffusion")}
+        if mode == "joint_residual":
+            residual = self.residual_correction(batch, residual_cfg)
+            stochastic = self.forward(batch, t=t, mode="diffusion")
+            return {**residual, "diffusion_outputs": stochastic}
         if mode == "flow_fusion":
             if flow_inputs is None:
                 raise ValueError("flow_inputs are required for flow_fusion mode.")
@@ -435,7 +423,7 @@ class RaEVDM(nn.Module):
                 "noise": zeros,
                 "xt": intensity_to_diffusion(residual_out["linear"]),
                 "eps_pred": zeros,
-                "x0_pred_raw": x0_pred,
+                "x0_pred_raw": intensity_to_diffusion(residual_out["pred_raw"]),
                 "x0_pred": x0_pred,
                 "x0": x0,
                 "event": residual_out["event"],
@@ -472,7 +460,25 @@ class RaEVDM(nn.Module):
         }
 
     @torch.no_grad()
+    def reconstruct(self, batch: Dict[str, torch.Tensor], flow_inputs=None, residual_cfg=None,
+                    base_raft_peak: float = 0.55) -> torch.Tensor:
+        """One deterministic predictor call, with no ground-truth-frame input."""
+        if self.use_occlusion_refinement:
+            mode = "occlusion_refinement"
+        elif self.use_flow_fusion:
+            mode = "flow_fusion"
+        else:
+            mode = "supervised_residual"
+        if self.use_flow_fusion:
+            result = self(batch, mode=mode, flow_inputs=flow_inputs,
+                          residual_cfg=residual_cfg, base_raft_peak=base_raft_peak)
+        else:
+            result = self.residual_correction(batch, residual_cfg)
+        return result["pred"].permute(0, 2, 1, 3, 4).contiguous()
+
+    @torch.no_grad()
     def sample(self, batch: Dict[str, torch.Tensor], sampling_steps: int = 50) -> torch.Tensor:
+        """Legacy iterative DDIM diagnostic; use reconstruct for paper inference."""
         frames = video_to_bcthw(batch["frames"].float())
         b, c, frames_t, h, w = frames.shape
         device = frames.device

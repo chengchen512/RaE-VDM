@@ -2,284 +2,212 @@ from __future__ import annotations
 
 import argparse
 import copy
-import math
 import os
-import time
 from pathlib import Path
-from typing import Any, Dict
 
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader
-from torch.utils.data.distributed import DistributedSampler
+from torch.utils.data import DataLoader, DistributedSampler
 from tqdm import tqdm
 
 from .data import RLEDClipDataset
+from .flow_warp import load_frozen_raft_small
 from .losses import compute_losses
 from .models import build_model
-from .utils import AverageMeter, count_parameters, load_config, make_run_dir, save_checkpoint, set_seed, to_device
+from .stages import (STAGES, CHECKPOINT_NAMES, activate_phase, configure_stage,
+                     geometry_inputs, load_stage_weights, optimizer_groups,
+                     phase_at_epoch, phase_weights, stage_forward)
+from .utils import load_config, make_run_dir, save_checkpoint, set_seed, to_device
 
 
-def setup_distributed() -> tuple[torch.device, int, int, int, bool]:
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    rank = int(os.environ.get("RANK", "0"))
-    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    distributed = world_size > 1
-    if distributed:
-        if not torch.cuda.is_available():
-            raise RuntimeError("Distributed training requires CUDA devices.")
-        torch.cuda.set_device(local_rank)
-        dist.init_process_group(backend="nccl", init_method="env://")
-        device = torch.device("cuda", local_rank)
-    else:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    return device, rank, local_rank, world_size, distributed
-
-
-def cleanup_distributed(distributed: bool) -> None:
-    if distributed and dist.is_initialized():
-        dist.barrier()
-        dist.destroy_process_group()
-
-
-def is_main_process(rank: int) -> bool:
-    return rank == 0
-
-
-def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
+def unwrap_model(model):
     return model.module if isinstance(model, DDP) else model
 
 
-def make_grad_scaler(enabled: bool):
-    try:
-        return torch.amp.GradScaler("cuda", enabled=enabled)
-    except TypeError:
-        return torch.cuda.amp.GradScaler(enabled=enabled)
+@torch.no_grad()
+def update_ema(ema, model, decay: float):
+    state = unwrap_model(model).state_dict()
+    for key, value in ema.state_dict().items():
+        if value.is_floating_point():
+            value.mul_(decay).add_(state[key].detach(), alpha=1 - decay)
+        else:
+            value.copy_(state[key])
 
 
-def set_requires_grad(model: torch.nn.Module, requires_grad: bool) -> None:
-    for param in model.parameters():
-        param.requires_grad_(requires_grad)
+def build_dataset(config, validation=False, smoke=False):
+    data = dict(config["data"])
+    if validation:
+        if config.get("validation_data"):
+            data.update(config["validation_data"])
+        else:
+            data["split"] = "val"
+        data.update(random_crop=False, random_flip=False)
+    if smoke:
+        data.update(split="all", max_files=1, crop_size=[32, 32], random_crop=False, random_flip=False)
+    return RLEDClipDataset(**data)
+
+
+def make_loader(dataset, config, validation=False, distributed=False, smoke=False):
+    workers = 0 if smoke else int(config["train"].get("num_workers", 0))
+    sampler = DistributedSampler(dataset, shuffle=True) if distributed and not validation else None
+    kwargs = dict(batch_size=1 if validation or smoke else int(config["train"]["batch_size"]),
+                  num_workers=workers, shuffle=not validation and sampler is None,
+                  sampler=sampler, pin_memory=torch.cuda.is_available(), drop_last=False)
+    if workers:
+        kwargs.update(persistent_workers=True, prefetch_factor=int(config["train"].get("prefetch_factor", 2)))
+    return DataLoader(dataset, **kwargs), sampler
 
 
 @torch.no_grad()
-def update_ema(ema_model: torch.nn.Module, model: torch.nn.Module, decay: float) -> None:
-    model_state = unwrap_model(model).state_dict()
-    ema_state = ema_model.state_dict()
-    for key, value in ema_state.items():
-        source = model_state[key].detach()
-        if torch.is_floating_point(value):
-            value.mul_(decay).add_(source, alpha=1.0 - decay)
+def validate(model, loader, config, device, raft=None, transforms=None, max_batches=20):
+    model.eval()
+    values = []
+    for index, batch in enumerate(loader):
+        if max_batches is not None and index >= max_batches:
+            break
+        batch = to_device(batch, device)
+        if config["train"]["stage"] == "pretrain" and config["train"].get("pretraining_objective", "diffusion") == "diffusion":
+            # Fixed RNG during validation, restored before training resumes.
+            with torch.random.fork_rng(devices=[device] if device.type == "cuda" else []):
+                torch.manual_seed(0)
+                out = model(batch, mode="diffusion")
+            values.append(-float((out["noise"] - out["eps_pred"]).square().mean()))
         else:
-            value.copy_(source)
+            flow = geometry_inputs(batch, raft, transforms) if model.use_flow_fusion else None
+            pred = model.reconstruct(batch, flow, config.get("residual", {}))
+            mse = (pred[:, 1:-1] - batch["frames"][:, 1:-1]).square().flatten(2).mean(-1)
+            values.append(float((-10 * mse.clamp_min(1e-12).log10()).mean()))
+    if not values:
+        raise RuntimeError("Validation contains no clips; provide validation_data explicitly.")
+    return sum(values) / len(values)
 
 
-def build_scheduler(
-    optimizer: torch.optim.Optimizer,
-    train_cfg: Dict[str, Any],
-    steps_per_epoch: int,
-) -> torch.optim.lr_scheduler.LambdaLR | None:
-    name = str(train_cfg.get("scheduler", "none")).lower()
-    if name in {"none", "constant", ""}:
-        return None
-    if name != "cosine":
-        raise ValueError(f"Unsupported scheduler: {name}")
-
-    epochs = int(train_cfg["epochs"])
-    total_steps = int(train_cfg.get("total_steps") or max(epochs * steps_per_epoch, 1))
-    warmup_steps = int(train_cfg.get("warmup_steps", 0))
-    base_lr = float(train_cfg["lr"])
-    min_lr = float(train_cfg.get("min_lr", 0.0))
-    min_ratio = min(max(min_lr / max(base_lr, 1e-12), 0.0), 1.0)
-
-    def lr_lambda(step: int) -> float:
-        if warmup_steps > 0 and step < warmup_steps:
-            return max((step + 1) / warmup_steps, 1e-6)
-        denom = max(total_steps - warmup_steps, 1)
-        progress = min(max((step - warmup_steps) / denom, 0.0), 1.0)
-        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
-        return min_ratio + (1.0 - min_ratio) * cosine
-
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
-
-
-def build_dataset(config: Dict[str, Any], smoke: bool = False) -> RLEDClipDataset:
-    data_cfg = dict(config["data"])
-    if smoke:
-        data_cfg["max_files"] = 1
-        data_cfg["crop_size"] = [64, 64]
-        data_cfg["random_crop"] = False
-        data_cfg["random_flip"] = False
-    return RLEDClipDataset(**data_cfg)
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser()
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Four-stage training from Sec. IV-A.")
     parser.add_argument("--config", required=True)
-    parser.add_argument("--resume", default=None)
-    parser.add_argument("--smoke", action="store_true", help="Run one tiny forward/backward step.")
-    args = parser.parse_args()
-
-    device, rank, local_rank, world_size, distributed = setup_distributed()
+    parser.add_argument("--stage", choices=STAGES)
+    parser.add_argument("--resume", help="Resume this stage, including optimizer state.")
+    parser.add_argument("--warm-start", help="Initialize from the previous stage; keep new heads.")
+    parser.add_argument("--smoke", action="store_true", help="One tiny optimizer step for debugging only.")
+    args = parser.parse_args(argv)
+    if args.resume and args.warm_start:
+        parser.error("Choose either --resume or --warm-start.")
     config = load_config(args.config)
+    stage = args.stage or config["train"].get("stage", "pretrain")
+    config = configure_stage(config, stage)
+    world = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    distributed = world > 1
+    device = torch.device("cuda", local_rank) if torch.cuda.is_available() else torch.device("cpu")
+    if device.type == "cuda":
+        torch.cuda.set_device(device)
+    if distributed:
+        dist.init_process_group("nccl" if device.type == "cuda" and os.name != "nt" else "gloo")
     set_seed(int(config.get("seed", 3407)) + rank)
     if args.smoke:
-        config["train"]["epochs"] = 1
-        config["train"]["max_steps_per_epoch"] = 1
-        config["train"]["batch_size"] = 1
-        config["train"]["mixed_precision"] = False
-
-    if is_main_process(rank):
-        run_dir = make_run_dir(config)
-    else:
-        run_dir = Path(config.get("output_dir", "outputs")) / config.get("run_name", "raevdm")
-    if distributed:
-        dist.barrier()
-
-    dataset = build_dataset(config, smoke=args.smoke)
-    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True) if distributed else None
-    num_workers = int(config["train"]["num_workers"])
-    loader_kwargs = {
-        "batch_size": int(config["train"]["batch_size"]),
-        "shuffle": sampler is None,
-        "sampler": sampler,
-        "num_workers": num_workers,
-        "pin_memory": device.type == "cuda",
-        "drop_last": True,
-    }
-    if num_workers > 0:
-        loader_kwargs["persistent_workers"] = True
-        loader_kwargs["prefetch_factor"] = int(config["train"].get("prefetch_factor", 4))
-    loader = DataLoader(dataset, **loader_kwargs)
-
+        config["train"].update(max_steps_per_epoch=1, num_workers=0, mixed_precision=False)
+        config["training_stages"][stage] = [{**config["training_stages"][stage][0], "epochs": 1}]
+    run_dir = Path(config.get("output_dir", "outputs")) / config.get("run_name", "raevdm")
+    if rank == 0:
+        make_run_dir(config)
+    loader, sampler = make_loader(build_dataset(config, smoke=args.smoke), config,
+                                  distributed=distributed, smoke=args.smoke)
+    validation = None
+    if rank == 0:
+        validation, _ = make_loader(build_dataset(config, validation=True, smoke=args.smoke), config,
+                                    validation=True, smoke=args.smoke)
     model = build_model(config).to(device)
-    start_epoch = 0
-    global_step = 0
+    checkpoint = None
+    if args.resume or args.warm_start:
+        checkpoint = torch.load(args.resume or args.warm_start, map_location="cpu", weights_only=True)
+        if args.resume:
+            if checkpoint.get("config", {}).get("train", {}).get("stage") != stage:
+                raise ValueError("Use --warm-start when moving between stages.")
+            model.load_state_dict(checkpoint["model"], strict=True)
+        else:
+            load_stage_weights(model, checkpoint, allow_new_heads=True)
+    elif stage != "pretrain":
+        raise ValueError("This stage needs --warm-start or --resume; do not silently train it from scratch.")
+    ema = copy.deepcopy(model).eval()
+    for parameter in ema.parameters():
+        parameter.requires_grad_(False)
+    if args.resume and "model_ema" in checkpoint:
+        ema.load_state_dict(checkpoint["model_ema"], strict=True)
+    optimizer = torch.optim.AdamW(optimizer_groups(model), weight_decay=float(config["train"].get("weight_decay", 1e-6)))
+    amp = bool(config["train"].get("mixed_precision", True)) and device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=amp)
+    start, step, best = 0, 0, float("-inf")
     if args.resume:
-        ckpt = torch.load(args.resume, map_location="cpu")
-        model.load_state_dict(ckpt["model"], strict=True)
-        start_epoch = int(ckpt.get("epoch", 0)) + 1
-        global_step = int(ckpt.get("step", 0))
-
+        optimizer.load_state_dict(checkpoint["optimizer"])
+        scaler.load_state_dict(checkpoint["scaler"])
+        start, step = int(checkpoint["epoch"]) + 1, int(checkpoint["step"])
+        best = float(checkpoint.get("best_score", best))
     if distributed:
-        model = DDP(
-            model,
-            device_ids=[local_rank],
-            output_device=local_rank,
-            find_unused_parameters=bool(config["train"].get("find_unused_parameters", False)),
-        )
-
-    ema_decay = float(config["train"].get("ema_decay", 0.0))
-    ema_model = None
-    if ema_decay > 0:
-        ema_model = copy.deepcopy(unwrap_model(model)).to(device)
-        ema_model.eval()
-        set_requires_grad(ema_model, False)
-        if args.resume and "ckpt" in locals() and "model_ema" in ckpt:
-            ema_model.load_state_dict(ckpt["model_ema"], strict=True)
-
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=float(config["train"]["lr"]),
-        weight_decay=float(config["train"]["weight_decay"]),
-    )
-    if args.resume and "ckpt" in locals() and "optimizer" in ckpt:
-        optimizer.load_state_dict(ckpt["optimizer"])
-        for state in optimizer.state.values():
-            for key, value in state.items():
-                if torch.is_tensor(value):
-                    state[key] = value.to(device)
-    scaler = make_grad_scaler(enabled=bool(config["train"]["mixed_precision"]) and device.type == "cuda")
-    if args.resume and "ckpt" in locals() and "scaler" in ckpt:
-        scaler.load_state_dict(ckpt["scaler"])
-    scheduler = build_scheduler(optimizer, config["train"], steps_per_epoch=max(len(loader), 1))
-    if scheduler is not None and args.resume and "ckpt" in locals() and "scheduler" in ckpt:
-        scheduler.load_state_dict(ckpt["scheduler"])
-
-    if is_main_process(rank):
-        print(f"device: {device}")
-        print(f"distributed: {distributed} world_size: {world_size}")
-        print(f"per_gpu_batch_size: {int(config['train']['batch_size'])}")
-        print(f"global_batch_size: {int(config['train']['batch_size']) * world_size}")
-        print(f"clips: {len(dataset)}")
-        print(f"parameters: {count_parameters(unwrap_model(model)) / 1e6:.2f} M")
-
-    loss_weights = dict(config["loss"])
-    charbonnier_eps = float(loss_weights.pop("charbonnier_eps", 1e-3))
-    event_bins = int(config["data"]["event_bins"])
-    max_steps = config["train"].get("max_steps_per_epoch")
-    log_every = int(config["train"].get("log_every", 20))
-
-    for epoch in range(start_epoch, int(config["train"]["epochs"])):
-        if sampler is not None:
-            sampler.set_epoch(epoch)
-        model.train()
-        meter = AverageMeter()
-        data_meter = AverageMeter()
-        iter_meter = AverageMeter()
-        end_time = time.perf_counter()
-        pbar = tqdm(loader, desc=f"epoch {epoch:03d}", dynamic_ncols=True, disable=not is_main_process(rank))
-        for step, batch in enumerate(pbar):
-            data_time = time.perf_counter() - end_time
-            if max_steps is not None and step >= int(max_steps):
-                break
-            batch = to_device(batch, device)
-            optimizer.zero_grad(set_to_none=True)
-            with torch.amp.autocast(device_type=device.type, enabled=bool(config["train"]["mixed_precision"]) and device.type == "cuda"):
-                training_mode = str(config["train"].get("training_mode", "diffusion"))
-                outputs = model(
-                    batch,
-                    mode=training_mode,
-                    residual_cfg=dict(config.get("residual", {})),
-                )
-                total, losses = compute_losses(
-                    batch,
-                    outputs,
-                    loss_weights,
-                    event_bins,
-                    charbonnier_eps,
-                    theory_cfg=dict(config.get("theory", {})),
-                )
-            scaler.scale(total).backward()
-            if float(config["train"].get("grad_clip", 0.0)) > 0:
+        # Register every parameter before changing freeze states between phases.
+        model = DDP(model, device_ids=[local_rank] if device.type == "cuda" else None,
+                    find_unused_parameters=True)
+    raft = transforms = None
+    if unwrap_model(model).use_flow_fusion:
+        path = os.environ.get("RAE_RAFT_WEIGHTS") or config.get("flow_fusion", {}).get("raft_weights")
+        if not path:
+            raise ValueError("Set RAE_RAFT_WEIGHTS or flow_fusion.raft_weights to a local RAFT-Small checkpoint.")
+        raft, transforms = load_frozen_raft_small(device, path)
+    epochs = sum(int(p["epochs"]) for p in config["training_stages"][stage])
+    previous_phase = checkpoint.get("phase") if args.resume else None
+    best_path = run_dir / "checkpoints" / CHECKPOINT_NAMES[stage]
+    try:
+        for epoch in range(start, epochs):
+            phase = phase_at_epoch(config, epoch)
+            if phase["name"] != previous_phase:
+                # Select within the final optimization phase of each stage.
+                best = float("-inf")
+                previous_phase = phase["name"]
+            activate_phase(optimizer, phase)
+            weights = phase_weights(config, phase)
+            if sampler is not None:
+                sampler.set_epoch(epoch)
+            model.train()
+            for index, batch in enumerate(tqdm(loader, desc=f"{stage}:{phase['name']} {epoch}", disable=rank != 0)):
+                limit = config["train"].get("max_steps_per_epoch")
+                if limit is not None and index >= int(limit):
+                    break
+                batch = to_device(batch, device)
+                flow = geometry_inputs(batch, raft, transforms,
+                                       int(config.get("flow_fusion", {}).get("flow_updates_train", 12))) \
+                    if raft is not None else None
+                optimizer.zero_grad(set_to_none=True)
+                with torch.amp.autocast(device_type=device.type, enabled=amp):
+                    out = stage_forward(model, batch, config, weights, flow, phase)
+                    total, losses = compute_losses(batch, out, weights, int(config["data"]["event_bins"]),
+                                                   float(config["loss"].get("charbonnier_eps", 1e-3)), config.get("theory"))
+                if not torch.isfinite(total):
+                    raise FloatingPointError(f"Non-finite loss at {stage}, epoch {epoch}, step {step}")
+                scaler.scale(total).backward()
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), float(config["train"]["grad_clip"]))
-            scaler.step(optimizer)
-            scaler.update()
-            if scheduler is not None:
-                scheduler.step()
-            if ema_model is not None:
-                update_ema(ema_model, model, ema_decay)
-
-            global_step += 1
-            meter.update(float(total.detach().cpu()), n=1)
-            iter_time = time.perf_counter() - end_time
-            data_meter.update(data_time, n=1)
-            iter_meter.update(iter_time, n=1)
-            if is_main_process(rank) and (global_step % log_every == 0 or args.smoke):
-                loss_text = " ".join([f"{k}:{float(v.detach().cpu()):.4f}" for k, v in losses.items()])
-                pbar.set_postfix_str(f"{loss_text} data:{data_meter.avg:.2f}s iter:{iter_meter.avg:.2f}s")
-            end_time = time.perf_counter()
-
-        if is_main_process(rank):
-            extra = {
-                "scaler": scaler.state_dict(),
-            }
-            if scheduler is not None:
-                extra["scheduler"] = scheduler.state_dict()
-            if ema_model is not None:
-                extra["model_ema"] = ema_model.state_dict()
-            save_checkpoint(run_dir / "checkpoints" / "latest.pt", unwrap_model(model), optimizer, epoch, global_step, config, extra=extra)
-            if (epoch + 1) % int(config["train"].get("save_every", 1)) == 0:
-                save_checkpoint(run_dir / "checkpoints" / f"epoch_{epoch:03d}.pt", unwrap_model(model), optimizer, epoch, global_step, config, extra=extra)
-            print(f"epoch {epoch:03d} avg_loss={meter.avg:.5f}")
-        if distributed:
-            dist.barrier()
-
-    if is_main_process(rank):
-        print(f"done. checkpoints: {run_dir / 'checkpoints'}")
-    cleanup_distributed(distributed)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), float(config["train"].get("grad_clip", 1.0)))
+                scaler.step(optimizer)
+                scaler.update()
+                update_ema(ema, model, float(config["train"].get("ema_decay", 0.9999)))
+                step += 1
+                if rank == 0 and (args.smoke or step % int(config["train"].get("log_every", 50)) == 0):
+                    print({key: float(value.detach()) for key, value in losses.items()})
+            if rank == 0:
+                score = validate(ema, validation, config, device, raft, transforms,
+                                 max_batches=1 if args.smoke else config.get("eval", {}).get("validation_batches", 20))
+                improved = score > best
+                best = max(best, score)
+                extra = dict(model_ema=ema.state_dict(), scaler=scaler.state_dict(), phase=phase["name"], best_score=best)
+                save_checkpoint(run_dir / "checkpoints/latest.pt", unwrap_model(model), optimizer, epoch, step, config, extra)
+                if improved:
+                    save_checkpoint(best_path, unwrap_model(model), optimizer, epoch, step, config, extra)
+                print(f"Validation score: {score:.6f}; selected checkpoint: {best_path}")
+            if distributed:
+                dist.barrier()
+    finally:
+        if distributed and dist.is_initialized():
+            dist.destroy_process_group()
 
 
 if __name__ == "__main__":

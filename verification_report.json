@@ -1,0 +1,190 @@
+{
+  "release": "0.2.0",
+  "aligned_manuscript": "Revised TCSVT manuscript, Sec. III and Sec. IV-A",
+  "tests": {
+    "passed": 28,
+    "failures": 0,
+    "errors": 0
+  },
+  "full_architecture_check": {
+    "device": "cuda",
+    "parameters": 16925995,
+    "shape": [
+      1,
+      7,
+      1,
+      32,
+      32
+    ],
+    "phases": [
+      {
+        "stage": "pretrain",
+        "phase": "denoising",
+        "finite_forward_and_backward": true,
+        "gradient_tensors": 188
+      },
+      {
+        "stage": "residual",
+        "phase": "residual",
+        "finite_forward_and_backward": true,
+        "gradient_tensors": 188
+      },
+      {
+        "stage": "flow",
+        "phase": "flow_head",
+        "finite_forward_and_backward": true,
+        "gradient_tensors": 30
+      },
+      {
+        "stage": "flow",
+        "phase": "flow_joint",
+        "finite_forward_and_backward": true,
+        "gradient_tensors": 218
+      },
+      {
+        "stage": "refinement",
+        "phase": "refinement_head",
+        "finite_forward_and_backward": true,
+        "gradient_tensors": 66
+      },
+      {
+        "stage": "refinement",
+        "phase": "refinement_flow",
+        "finite_forward_and_backward": true,
+        "gradient_tensors": 96
+      },
+      {
+        "stage": "refinement",
+        "phase": "end_to_end",
+        "finite_forward_and_backward": true,
+        "gradient_tensors": 284
+      }
+    ],
+    "deterministic_predictor_calls": 1,
+    "anchors_exact": true,
+    "optimizer_updates": 0,
+    "trained_weights_written": false,
+    "geometry": "Analytic zero-flow fixture; not a real-RAFT accuracy benchmark."
+  },
+  "frozen_raft_integration_check": {
+    "device": "cuda",
+    "parameters": 16925995,
+    "shape": [
+      1,
+      7,
+      1,
+      128,
+      128
+    ],
+    "phases": [
+      {
+        "stage": "pretrain",
+        "phase": "denoising",
+        "finite_forward_and_backward": true,
+        "gradient_tensors": 188
+      },
+      {
+        "stage": "residual",
+        "phase": "residual",
+        "finite_forward_and_backward": true,
+        "gradient_tensors": 188
+      },
+      {
+        "stage": "flow",
+        "phase": "flow_head",
+        "finite_forward_and_backward": true,
+        "gradient_tensors": 30
+      },
+      {
+        "stage": "flow",
+        "phase": "flow_joint",
+        "finite_forward_and_backward": true,
+        "gradient_tensors": 218
+      },
+      {
+        "stage": "refinement",
+        "phase": "refinement_head",
+        "finite_forward_and_backward": true,
+        "gradient_tensors": 66
+      },
+      {
+        "stage": "refinement",
+        "phase": "refinement_flow",
+        "finite_forward_and_backward": true,
+        "gradient_tensors": 96
+      },
+      {
+        "stage": "refinement",
+        "phase": "end_to_end",
+        "finite_forward_and_backward": true,
+        "gradient_tensors": 284
+      }
+    ],
+    "deterministic_predictor_calls": 1,
+    "anchors_exact": true,
+    "optimizer_updates": 0,
+    "trained_weights_written": false,
+    "geometry": "Frozen pretrained RAFT-Small on synthetic anchors; not a dataset accuracy benchmark."
+  },
+  "python_files_parsed": 37,
+  "required_data_modules_present": true,
+  "figure_generation_code_included": false,
+  "model_weights_included": false,
+  "datasets_included": false,
+  "training_executed": false,
+  "dataset_accuracy_claims_verified": false,
+  "source_archive_sha256": "9e7fb0a5d57162f5e1648c8adc5d916920f3d33fbb015e0e9a9df559d81e44f7",
+  "source_changes": {
+    "added": [
+      "configs/paper.yaml",
+      "configs/train_flow_fusion.yaml",
+      "configs/train_occlusion_refinement.yaml",
+      "configs/train_residual.yaml",
+      "docs/migration.md",
+      "src/raevdm/data/__init__.py",
+      "src/raevdm/data/event_voxel.py",
+      "src/raevdm/data/rled_h5.py",
+      "src/raevdm/event_statistics.py",
+      "src/raevdm/runtime.py",
+      "src/raevdm/stages.py",
+      "tests/conftest.py",
+      "tests/test_data_and_entrypoints.py",
+      "tests/test_model_stages.py",
+      "tests/test_paper_equations.py",
+      "tools/check_implementation.py"
+    ],
+    "modified": [
+      ".gitignore",
+      "README.md",
+      "RELEASE_AUDIT.md",
+      "configs/inference.yaml",
+      "configs/stage_base.yaml",
+      "configs/train_core.yaml",
+      "docs/theory_to_code.md",
+      "infer_full_resolution.py",
+      "infer_local.py",
+      "pyproject.toml",
+      "src/raevdm/__init__.py",
+      "src/raevdm/evaluate.py",
+      "src/raevdm/flow_warp.py",
+      "src/raevdm/infer.py",
+      "src/raevdm/losses.py",
+      "src/raevdm/metrics.py",
+      "src/raevdm/models/flow_fusion.py",
+      "src/raevdm/models/occlusion_refinement.py",
+      "src/raevdm/models/raevdm.py",
+      "src/raevdm/models/reliability.py",
+      "src/raevdm/train.py",
+      "src/raevdm/utils.py",
+      "tools/check_event_representation.py",
+      "train_pipeline.py",
+      "training/README.md",
+      "training/stages/train_flow_fusion.py",
+      "training/stages/train_occlusion_refinement.py",
+      "training/stages/train_residual.py"
+    ],
+    "removed": [
+      "training/stages/train_joint.py"
+    ]
+  }
+}

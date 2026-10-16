@@ -1,19 +1,15 @@
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import sys
 from pathlib import Path
 
 import h5py
 import numpy as np
 
-event_voxel_path = Path(__file__).resolve().parents[1] / "src" / "raevdm" / "data" / "event_voxel.py"
-spec = importlib.util.spec_from_file_location("event_voxel", event_voxel_path)
-event_voxel = importlib.util.module_from_spec(spec)
-assert spec.loader is not None
-spec.loader.exec_module(event_voxel)
-build_event_representation = event_voxel.build_event_representation
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from raevdm.data.event_voxel import build_event_representation
+from raevdm.data.rled_h5 import read_image_node
 
 
 def main() -> None:
@@ -29,7 +25,7 @@ def main() -> None:
         k0, k1 = args.frame0, args.frame0 + 1
         img0 = f["images"][keys[k0]]
         img1 = f["images"][keys[k1]]
-        h, w = map(int, img0.attrs["size"][:2])
+        h, w = read_image_node(img0).shape[:2]
         crop_h = crop_w = min(args.crop_size, h, w)
         top = (h - crop_h) // 2
         left = (w - crop_w) // 2

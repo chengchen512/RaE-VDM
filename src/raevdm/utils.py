@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import copy
 import random
 from pathlib import Path
 from typing import Any, Dict
@@ -10,10 +11,27 @@ import torch
 import yaml
 
 
-def load_config(path: str | Path) -> Dict[str, Any]:
+def merge_config(base: Dict[str, Any], update: Dict[str, Any]) -> Dict[str, Any]:
+    result = copy.deepcopy(base)
+    for key, value in update.items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = merge_config(result[key], value)
+        else:
+            result[key] = copy.deepcopy(value)
+    return result
+
+
+def load_config(path: str | Path, _seen=None) -> Dict[str, Any]:
     path = Path(path)
+    path = path.resolve()
+    seen = set() if _seen is None else set(_seen)
+    if path in seen:
+        raise ValueError(f"Cyclic configuration inheritance: {path}")
+    seen.add(path)
     with path.open("r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+        config = yaml.safe_load(f) or {}
+    base = config.pop("_base_", None)
+    return merge_config(load_config(path.parent / base, seen), config) if base else config
 
 
 def save_config(config: Dict[str, Any], path: str | Path) -> None:
@@ -77,7 +95,7 @@ def save_checkpoint(
 
 
 def load_checkpoint(path: str | Path, model: torch.nn.Module, optimizer: torch.optim.Optimizer | None = None) -> Dict[str, Any]:
-    ckpt = torch.load(path, map_location="cpu")
+    ckpt = torch.load(path, map_location="cpu", weights_only=True)
     model.load_state_dict(ckpt["model"], strict=True)
     if optimizer is not None and "optimizer" in ckpt:
         optimizer.load_state_dict(ckpt["optimizer"])

@@ -88,17 +88,19 @@ class FlowResidualFusionHead(nn.Module):
         alpha_delta = torch.tanh(raw[:, :1]) * self.alpha_delta_scale
         refinement = torch.tanh(raw[:, 1:2]) * self.refinement_scale
 
-        base_alpha = (float(base_raft_peak) * time_map).clamp(0.02, 0.98)
+        time_strength = 4.0 * time_map * (1.0 - time_map)
+        base_alpha = (float(base_raft_peak) * time_strength).clamp(0.02, 0.98)
         base_logit = torch.log(base_alpha) - torch.log1p(-base_alpha)
         alpha = torch.sigmoid(base_logit + alpha_delta)
         alpha = alpha * (1.0 - keyframe_mask)
 
         fused_base = alpha * warped_video + (1.0 - alpha) * residual_video
-        pred = fused_base + refinement * (1.0 - keyframe_mask)
-        pred = pred.clamp(0.0, 1.0)
+        pred_raw = fused_base + refinement
+        pred = pred_raw.clamp(0.0, 1.0)
         pred = pred * (1.0 - keyframe_mask) + residual_video * keyframe_mask
         return {
             "pred": pred,
+            "pred_raw": pred_raw,
             "fused_base": fused_base,
             "alpha": alpha,
             "alpha_delta": alpha_delta,

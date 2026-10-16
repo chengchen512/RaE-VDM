@@ -1,0 +1,114 @@
+seed: 3407
+run_name: raevdm_tcsvt
+output_dir: outputs
+implementation_version: tcsvt-20261016
+
+data:
+  root: data/RLED/train
+  split: train
+  file_pattern: "**/*.h5"
+  max_files: null
+  clip_len: 7
+  clip_stride: 1
+  frame_step: 3
+  event_bins: 5
+  crop_size: [256, 256]
+  random_crop: true
+  random_flip: true
+  keyframe_policy: endpoints
+  keyframe_stride: 6
+  contrast_threshold: 0.2
+  val_every: 10
+  event_cache_size: 16
+
+model:
+  in_channels: 1
+  event_feature_channels: 48
+  base_channels: 48
+  channel_mult: [1, 2, 4]
+  time_embed_dim: 192
+  use_reliability: true
+  use_observability: true
+  reliability_cue_channels: 4
+  event_gate_source: count
+  use_linear_condition: true
+  use_flow_fusion: false
+  flow_fusion_hidden_channels: 32
+  flow_fusion_refinement_scale: 0.05
+  flow_fusion_alpha_delta_scale: 2.0
+  use_occlusion_refinement: false
+  occlusion_refinement_hidden_channels: 32
+  occlusion_refinement_scale: 0.06
+  occlusion_branch_delta_scale: 0.30
+
+diffusion:
+  timesteps: 1000
+  beta_start: 0.0001
+  beta_end: 0.02
+  schedule: linear
+
+theory:
+  support_kappa: 1.0
+  quiet_margin: 0.02
+  intensity_eps: 0.0001
+
+residual:
+  residual_scale: 0.30
+  residual_timestep: 0
+  residual_tanh_temperature: 2.0
+  event_gate_floor: 0.08
+  event_gate_power: 0.50
+
+loss:
+  reconstruction: 1.0
+  event_physics: 0.05
+  quiet: 0.01
+  temporal: 0.005
+  anchor: 0.0
+  diffusion: 0.0
+  reliability_supervision: 0.0
+  charbonnier_eps: 0.001
+
+train:
+  stage: pretrain
+  batch_size: 2
+  num_workers: 8
+  prefetch_factor: 4
+  ema_decay: 0.9999
+  weight_decay: 0.000001
+  grad_clip: 1.0
+  mixed_precision: true
+  log_every: 50
+  save_every: 1
+  max_steps_per_epoch: null
+  find_unused_parameters: true
+
+# Rates/epochs from Sec. IV-A. Zero rates freeze the corresponding modules.
+training_stages:
+  pretrain:
+    - {name: denoising, epochs: 120, backbone_lr: 0.0002, diffusion: 1.0, reconstruction_losses: false}
+  residual:
+    - {name: residual, epochs: 20, backbone_lr: 0.00002, diffusion: 0.05, confidence: 1.0}
+  flow:
+    - {name: flow_head, epochs: 3, flow_lr: 0.0001}
+    - {name: flow_joint, epochs: 12, flow_lr: 0.000002, backbone_lr: 0.000002, diffusion: 0.05}
+  refinement:
+    - {name: refinement_head, epochs: 3, refinement_lr: 0.00008, anchor: 0.1}
+    - {name: refinement_flow, epochs: 9, refinement_lr: 0.00008, flow_lr: 0.000008, anchor: 0.1}
+    - {name: end_to_end, epochs: 3, refinement_lr: 0.00008, flow_lr: 0.000008, backbone_lr: 0.0000005, diffusion: 0.05, confidence: 1.0, anchor: 0.1}
+
+flow_fusion:
+  raft_weights: null
+  flow_updates_train: 12
+  flow_updates_val: 12
+  base_raft_peak: 0.55
+
+inference:
+  mode: deterministic
+  tile_size: 256
+  tile_overlap: 64
+
+eval:
+  batch_size: 1
+  num_workers: 0
+  max_batches: null

@@ -168,12 +168,13 @@ class OcclusionAwareRefinementHead(nn.Module):
             torch.tanh(raw[:, 4:5])
             * self.refinement_scale
             * refinement_focus
-            * (1.0 - keyframe_mask)
         )
-        pred = (base_prediction + branch_adjustment + refinement).clamp(0.0, 1.0)
+        pred_raw = base_prediction + branch_adjustment + refinement
+        pred = pred_raw.clamp(0.0, 1.0)
         pred = pred * (1.0 - keyframe_mask) + base_prediction * keyframe_mask
         return {
             "pred": pred,
+            "pred_raw": pred_raw,
             "branch_deltas": branch_deltas,
             "branch_adjustment": branch_adjustment,
             "refinement_v2": refinement,

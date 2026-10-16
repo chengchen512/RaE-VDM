@@ -15,7 +15,7 @@ def _groups(channels: int) -> int:
 
 
 class ReliabilityEstimator(nn.Module):
-    """Predict polarity reliability and no-event observability from raw events."""
+    """Predict event-use confidence and low-event observability (not validity probabilities)."""
 
     def __init__(self, in_channels: int = 2, hidden_channels: int = 32) -> None:
         super().__init__()
@@ -44,7 +44,7 @@ class ReliabilityEstimator(nn.Module):
 
 
 class ReliabilityCalibratedEventEncoder(nn.Module):
-    """Build condition features from reliability-calibrated event evidence."""
+    """Seven-channel event condition in Eq. (18); legacy parameter names retained."""
 
     def __init__(
         self,
@@ -53,11 +53,21 @@ class ReliabilityCalibratedEventEncoder(nn.Module):
         use_reliability: bool = True,
         use_observability: bool = True,
         cue_channels: int = 0,
+        confidence_mode: str = "learned",
+        confidence_threshold: float = 0.5,
+        observability_mode: str = "learned",
     ) -> None:
         super().__init__()
         self.use_reliability = use_reliability
         self.use_observability = use_observability
         self.cue_channels = int(max(cue_channels, 0))
+        if confidence_mode not in {"learned", "equal", "hard", "prior"}:
+            raise ValueError("Unknown confidence_mode")
+        if observability_mode not in {"learned", "prior", "naive", "zero"}:
+            raise ValueError("Unknown observability_mode")
+        self.confidence_mode = confidence_mode
+        self.confidence_threshold = float(confidence_threshold)
+        self.observability_mode = observability_mode
         self.reliability = ReliabilityEstimator(2 + self.cue_channels, hidden_channels)
         self.encoder = nn.Sequential(
             nn.Conv3d(7, feature_channels, 3, padding=1),
@@ -91,6 +101,25 @@ class ReliabilityCalibratedEventEncoder(nn.Module):
         reliability = pred["reliability"]
         observability = pred["observability"]
 
+        if self.confidence_mode == "equal":
+            reliability = torch.ones_like(reliability)
+        elif self.confidence_mode == "hard":
+            hard = (reliability >= self.confidence_threshold).to(reliability.dtype)
+            # Hard decisions at inference; straight-through gradients when retraining.
+            reliability = reliability + (hard - reliability).detach() if self.training else hard
+        elif self.confidence_mode == "prior":
+            if prior_reliability is None:
+                raise ValueError("Prior-R requires event_prior_reliability")
+            reliability = prior_reliability.to(reliability)
+        if self.observability_mode == "prior":
+            if prior_observability is None:
+                raise ValueError("Prior-Obs requires event_prior_observability")
+            observability = prior_observability.to(observability)
+        elif self.observability_mode == "naive":
+            observability = torch.ones_like(observability)
+        elif self.observability_mode == "zero":
+            observability = torch.zeros_like(observability)
+
         if not self.use_reliability:
             reliability = torch.ones_like(reliability)
         if not self.use_observability:
@@ -111,7 +140,9 @@ class ReliabilityCalibratedEventEncoder(nn.Module):
             "features": features,
             "condition": condition,
             "reliability": reliability,
+            "event_use_confidence": reliability,
             "observability": observability,
+            "low_event_observability": observability,
             "prior_reliability": prior_reliability,
             "prior_observability": prior_observability,
             "auxiliary_cues": auxiliary_cues,

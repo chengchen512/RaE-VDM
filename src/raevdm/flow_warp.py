@@ -25,6 +25,8 @@ def load_frozen_raft_small(
         model = raft_small(weights=None, progress=False)
         state = torch.load(path, map_location="cpu", weights_only=True)
         model.load_state_dict(state, strict=True)
+    elif path is not None:
+        raise FileNotFoundError(f"RAFT weights do not exist: {path}")
     else:
         model = raft_small(weights=weights, progress=True)
 
@@ -106,7 +108,7 @@ def flow_endpoint_confidence(
 def forward_splat(
     image: torch.Tensor,
     flow: torch.Tensor,
-    scale: float,
+    scale: float | torch.Tensor,
     confidence: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     b, c, h, w = image.shape
@@ -115,8 +117,10 @@ def forward_splat(
         torch.arange(w, device=image.device, dtype=image.dtype),
         indexing="ij",
     )
-    dst_x = xx[None] + float(scale) * flow[:, 0]
-    dst_y = yy[None] + float(scale) * flow[:, 1]
+    if torch.is_tensor(scale):
+        scale = scale.to(flow).reshape(b, 1, 1)
+    dst_x = xx[None] + scale * flow[:, 0]
+    dst_y = yy[None] + scale * flow[:, 1]
     x0 = torch.floor(dst_x)
     y0 = torch.floor(dst_y)
     x1 = x0 + 1.0
@@ -164,7 +168,6 @@ def synthesize_bidirectional_warp_video(
 
     for frame_index in range(int(frames_t)):
         t = float(frame_index) / float(max(int(frames_t) - 1, 1))
-        time_strength = 4.0 * t * (1.0 - t)
         if frame_index == 0:
             warped = image0
             confidence = torch.ones_like(image0)
@@ -183,7 +186,7 @@ def synthesize_bidirectional_warp_video(
 
         warped_frames.append(warped)
         confidence_frames.append(confidence)
-        time_frames.append(torch.full_like(image0, time_strength))
+        time_frames.append(torch.ones_like(image0) * t)
 
     return (
         torch.stack(warped_frames, dim=2),
@@ -199,13 +202,9 @@ def synthesize_occlusion_aware_warp_video(
     flow01: torch.Tensor,
     flow10: torch.Tensor,
     frames_t: int,
+    timestamps: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Return the legacy aggregate warp plus explicit occlusion diagnostics.
-
-    The aggregate warp follows the same equations as
-    ``synthesize_bidirectional_warp_video`` so an existing flow-fusion
-    checkpoint retains its exact input distribution.
-    """
+    """Endpoint splats, target-domain agreement, visibility, and normalized alpha."""
 
     conf0, conf1 = flow_endpoint_confidence(image0, image1, flow01, flow10)
     boundary0 = _flow_boundary_strength(flow01)
@@ -224,8 +223,12 @@ def synthesize_occlusion_aware_warp_video(
 
     total_frames = int(frames_t)
     for frame_index in range(total_frames):
-        t = float(frame_index) / float(max(total_frames - 1, 1))
-        time_strength = 4.0 * t * (1.0 - t)
+        if timestamps is None:
+            t = float(frame_index) / float(max(total_frames - 1, 1))
+        else:
+            times = timestamps if timestamps.ndim == 2 else timestamps[None]
+            t = ((times[:, frame_index] - times[:, 0]) / (times[:, -1] - times[:, 0])).to(image0)
+            t = t.reshape(-1, 1, 1, 1)
         if frame_index == 0:
             warped = image0
             confidence = torch.ones_like(image0)
@@ -260,7 +263,8 @@ def synthesize_occlusion_aware_warp_video(
             weight = weighted0 + weighted1
             warped = ((1.0 - t) * value0 + t * value1) / weight.clamp_min(1e-6)
             warped = torch.where(weight < 0.02, linear, warped).clamp(0.0, 1.0)
-            confidence = (1.0 - torch.exp(-weight)).clamp(0.0, 1.0)
+            confidence = ((1.0 - torch.exp(-weight))
+                          * torch.exp(-(endpoint0 - endpoint1).abs() / 0.10)).clamp(0.0, 1.0)
 
             visibility0 = weighted0 / weight.clamp_min(1e-6)
             visibility1 = weighted1 / weight.clamp_min(1e-6)
@@ -283,7 +287,7 @@ def synthesize_occlusion_aware_warp_video(
 
         warped_frames.append(warped)
         confidence_frames.append(confidence)
-        time_frames.append(torch.full_like(image0, time_strength))
+        time_frames.append(torch.ones_like(image0) * t)
         endpoint0_frames.append(endpoint0)
         endpoint1_frames.append(endpoint1)
         visibility0_frames.append(visibility0)

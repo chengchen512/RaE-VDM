@@ -11,19 +11,22 @@ only the source-resolution comparison used in this README.
 
 ## Highlights
 
-- RLED H5 reader for grayscale frames and asynchronous events.
-- Reliability- and observability-aware event representation.
+- RLED H5 reader with timestamp-aware event voxelization and polarity-specific thresholds.
+- Reliability- and observability-aware conditioning with count-domain residual gates.
 - Conditional 3D U-Net diffusion prior for intermediate-frame prediction.
 - Residual correction, frozen RAFT flow fusion, and occlusion refinement.
 - Single-GPU and distributed training.
-- Center-crop and tiled full-resolution inference.
+- Deterministic interpolation and tiled native-resolution inference.
+- Sequence-balanced evaluation on intermediate frames and synthetic regression tests.
 
 ## Full-Resolution Demo
 
 ![RaE-VDM full-resolution interpolation comparison](assets/demo_fullres_comparison.gif)
 
-The frozen final checkpoint predicts five intermediate frames from two shared
-endpoint frames and the intervening event stream. This RLED example is inferred
+This demo was generated with the previous released checkpoint and is retained
+for reference; it is not a new measurement of the updated implementation.
+It predicts five intermediate frames from two shared endpoint frames and the
+intervening event stream. This RLED example is inferred
 over the complete **1120 x 660** field of view using overlapping 256 x 256
 tiles; it is not a resized 256 x 256 test.
 
@@ -39,26 +42,26 @@ inspection. Exact values and protocol metadata are stored in
 
 ```text
 assets/                               README demo GIF, MP4, poster, and metrics
-configs/                              Training and inference configurations
-docs/                                 Theory-to-code notes
+configs/paper.yaml                    Shared model and four-stage training recipe
+configs/                              Stage-specific and inference configurations
+docs/                                 Theory-to-code and migration notes
 src/raevdm/                           Core package
-tools/                                Dataset inspection utilities
-training/stages/                      Final-model training stages
-train.py                              Standard training entry point
+src/raevdm/data/                      RLED reader and event voxelization
+tests/                                Data, model, equations, and CLI checks
+tools/                                Dataset and implementation checks
 infer.py                              Standard inference entry point
 evaluate.py                           Standard evaluation entry point
-train_pipeline.py                     End-to-end final training launcher
 infer_local.py                        Final-model local inference
 infer_full_resolution.py              Tiled native-resolution inference
 ```
 
 ## Installation
 
-Python 3.9 or newer is required. Install a CUDA-enabled PyTorch build that
+Python 3.10 or newer is required. Install a CUDA-enabled PyTorch build that
 matches your driver first, then install this package:
 
 ```bash
-git clone <repository-url> RaE-VDM
+git clone https://github.com/chengchen512/RaE-VDM.git
 cd RaE-VDM
 python -m pip install -e .
 ```
@@ -92,68 +95,87 @@ No RLED files are distributed in this repository.
 
 ## Inference
 
-The final flow/occlusion model uses RAFT-assisted inference. Set the three
-paths and run the local entry point:
+The final flow/occlusion model uses RAFT-assisted deterministic inference.
+Provide the config, model checkpoint, local RAFT weights, and input H5 file:
 
 ```bash
-export RAE_CONFIG=configs/inference.yaml
-export RAE_CHECKPOINT=/path/to/FINAL_BEST_INFERENCE.pt
-export RAE_RAFT_WEIGHTS=/path/to/raft_small_C_T_V2-01064c6d.pth
-export RAE_TEST_H5=/path/to/sample.h5
-python infer_local.py
+python infer.py --config configs/inference.yaml \
+  --checkpoint /path/to/FINAL_BEST_INFERENCE.pt \
+  --raft-weights /path/to/raft_small_C_T_V2-01064c6d.pth \
+  --h5 /path/to/sample.h5
 ```
 
 For native-resolution inputs, use tiled inference:
 
 ```bash
-python infer_full_resolution.py --num-samples 8
+python infer_full_resolution.py --config configs/inference.yaml \
+  --checkpoint /path/to/FINAL_BEST_INFERENCE.pt \
+  --raft-weights /path/to/raft_small_C_T_V2-01064c6d.pth \
+  --h5 /path/to/sample.h5 --num-samples 8 --tile-size 256 --overlap 64
 ```
 
-`infer_local.py` can also be run without environment variables: edit its
-checkpoint and H5 defaults near the top of the file, then run it from an IDE.
-The lightweight `infer.py` entry point is retained for diffusion-core
-checkpoints that do not use the RAFT geometry stages.
+`infer_local.py` is a compatibility entry point to the same inference code.
+Paths can also be supplied through `RAE_CONFIG`, `RAE_CHECKPOINT`,
+`RAE_RAFT_WEIGHTS`, and `RAE_TEST_H5`. The checkpoint's saved architecture
+determines which model stages are enabled. See [migration notes](docs/migration.md)
+for compatibility and changed numerical behavior of older checkpoints.
 
 ## Standard Training
 
-Run a quick data/model validation first:
+Run a one-step training smoke check with the configured dataset first:
 
 ```bash
-python train.py --config configs/train_core.yaml --smoke
+python -m raevdm.train --config configs/train_core.yaml --smoke
 ```
 
 Single GPU:
 
 ```bash
-python train.py --config configs/train_core.yaml
+python -m raevdm.train --config configs/train_core.yaml
 ```
 
 Two GPUs:
 
 ```bash
-torchrun --standalone --nproc_per_node=2 train.py \
+torchrun --standalone --nproc_per_node=2 --module raevdm.train \
   --config configs/train_core.yaml
 ```
 
-Resume without overwriting the source checkpoint:
+Resume the same stage, including optimizer state:
 
 ```bash
-torchrun --standalone --nproc_per_node=2 train.py \
+torchrun --standalone --nproc_per_node=2 --module raevdm.train \
   --config configs/train_core.yaml \
   --resume /path/to/latest.pt
 ```
+
+The shared recipe is defined in `configs/paper.yaml`. Use `--warm-start` to
+initialize a new stage from the previous stage's checkpoint.
 
 ## Evaluation
 
 ```bash
 python evaluate.py \
-  --config configs/train_core.yaml \
-  --checkpoint /path/to/core_checkpoint.pt \
-  --sampling-steps 50
+  --config configs/inference.yaml \
+  --checkpoint /path/to/FINAL_BEST_INFERENCE.pt \
+  --raft-weights /path/to/raft_small_C_T_V2-01064c6d.pth \
+  --data-root /path/to/RLED/test --tiled
 ```
 
-This compact evaluator covers the diffusion core. Paper-specific benchmark
-and figure-generation programs are intentionally excluded from this release.
+Evaluation uses the shared deterministic inference path. PSNR, SSIM, and MAE
+exclude the observed anchors; results are averaged within each sequence and
+then across sequences. The JSON report also includes temporal error. LPIPS is
+optional via `--lpips-weights` after installing `pip install -e ".[perceptual]"`.
+
+## Implementation Checks
+
+```bash
+python -m pip install -e ".[test]"
+python -m pytest -q
+python tools/check_implementation.py --device cpu
+```
+
+These checks use synthetic inputs and do not establish dataset accuracy.
 
 ## Reproducibility Notes
 

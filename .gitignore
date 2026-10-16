@@ -10,10 +10,10 @@ __pycache__/
 .venv/
 venv/
 
-data/
-datasets/
-outputs/
-logs/
+/data/
+/datasets/
+/outputs/
+/logs/
 tmp/
 paper_experiments/
 
